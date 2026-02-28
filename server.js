@@ -11,6 +11,7 @@
 const http = require("http");
 const dns = require("dns").promises;
 const net = require("net");
+const tls = require("tls");
 const { URL } = require("url");
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
@@ -127,7 +128,7 @@ function normalizeUrl(input) {
   u.hash = "";
   return u;
 }
-
+// Fetch html
 async function fetchHtmlWithGuards(startUrl) {
   let current = startUrl;
   const redirects = [];
@@ -193,6 +194,99 @@ async function fetchHtmlWithGuards(startUrl) {
   throw Object.assign(new Error("Too many redirects"), { code: "EREDIRMAX" });
 }
 
+// detect delivery
+function detectDelivery(headers) {
+  const h = {};
+  for (const [k, v] of Object.entries(headers || {})) h[k.toLowerCase()] = String(v);
+
+  const enc = (h["content-encoding"] || "").toLowerCase() || null;
+  const ct = h["content-type"] || null;
+  const cl = h["content-length"] ? Number(h["content-length"]) : null;
+
+  const vary = h["vary"] || null;
+
+  return {
+    contentType: ct,
+    contentLengthHeader: Number.isFinite(cl) ? cl : null,
+    contentEncoding: enc, // gzip/br/deflate/zstd/null
+    isCompressed: enc ? ["gzip", "br", "deflate", "zstd"].some((x) => enc.includes(x)) : false,
+    varyAcceptEncoding: vary ? /accept-encoding/i.test(vary) : false,
+    evidence: [
+      enc ? `header:content-encoding=${enc}` : "header:content-encoding missing",
+      h["content-length"] ? `header:content-length=${h["content-length"]}` : "header:content-length missing",
+      vary ? `header:vary=${vary}` : "header:vary missing",
+    ],
+  };
+}
+
+
+// Detection protocols
+async function detectProtocols(finalUrl, headers) {
+  const out = {
+    transport: finalUrl.startsWith("https:") ? "https" : "http",
+    http2: null,     // true/false/null (unknown)
+    http3: null,     // true/false/null (unknown)
+    evidence: [],
+  };
+
+  const altSvc = (headers["alt-svc"] || headers["Alt-Svc"] || "").toString();
+  if (altSvc) {
+    if (/\bh3(=|-)/i.test(altSvc)) {
+      out.http3 = true;
+      out.evidence.push(`header:alt-svc=${altSvc.slice(0, 120)}`);
+    } else {
+      out.http3 = false;
+      out.evidence.push("header:alt-svc present (no h3 token)");
+    }
+  }
+
+  if (finalUrl.startsWith("https:")) {
+    try {
+      const u = new URL(finalUrl);
+      const port = u.port ? Number(u.port) : 443;
+
+      await assertPublicHostname(u.hostname);
+
+      const alpn = await new Promise((resolve, reject) => {
+        const socket = tls.connect({
+          host: u.hostname,
+          port,
+          servername: u.hostname,
+          ALPNProtocols: ["h2", "http/1.1"],
+          timeout: 5000,
+        });
+
+        socket.once("secureConnect", () => {
+          const proto = socket.alpnProtocol || null;
+          socket.end();
+          resolve(proto);
+        });
+
+        socket.once("error", reject);
+        socket.once("timeout", () => {
+          socket.destroy();
+          reject(new Error("ALPN timeout"));
+        });
+      });
+
+      if (alpn === "h2") {
+        out.http2 = true;
+        out.evidence.push("tls:alpn=h2");
+      } else if (alpn === "http/1.1") {
+        out.http2 = false;
+        out.evidence.push("tls:alpn=http/1.1");
+      } else {
+        out.http2 = null;
+        out.evidence.push("tls:alpn=unknown");
+      }
+    } catch {
+      out.http2 = null;
+      out.evidence.push("tls:alpn check failed");
+    }
+  }
+
+  return out;
+}
 // -------------------------
 // Detection config
 // -------------------------
@@ -239,7 +333,351 @@ const DETECTION_RULES = [
     comments: "x-nf-request-id is a strong signal.",
     any: [{ type: "header", header: "x-nf-request-id", re: /.+/i, evidence: () => ["header:x-nf-request-id"] }],
   },
+// ---- PWA (Progressive Web App) hints ----
+{
+  category: "app_capability",
+  name: "PWA (hint)",
+  confidence: 0.8,
+  comments: "Manifest + service worker registration are the strongest passive signals.",
+  any: [
+    { type: "html", re: /<link[^>]+rel=["']manifest["']/i, evidence: () => ["html:link rel=manifest"] },
+    { type: "html", re: /navigator\.serviceWorker\.register\s*\(/i, evidence: () => ["js:serviceWorker.register(...)"] , bumpConfidenceTo: 0.9 },
+    { type: "html", re: /<meta[^>]+name=["']theme-color["']/i, evidence: () => ["html:meta theme-color"] },
+    { type: "html", re: /apple-touch-icon/i, evidence: () => ["html:apple-touch-icon"] },
+  ],
+  note: "Hint only. A manifest alone does not guarantee installability; fetching and validating the manifest would improve accuracy.",
+},
 
+// ---- Databases / Data services (mostly hint-based) ----
+{
+  category: "database_hint",
+  name: "Firebase (hint)",
+  confidence: 0.85,
+  comments: "Firebase is often detectable because client SDKs/endpoints appear in the frontend.",
+  any: [
+    { type: "html", re: /www\.gstatic\.com\/firebasejs\//i, evidence: () => ["script:gstatic/firebasejs"] },
+    { type: "html", re: /firebase(app|analytics|auth|firestore|database)\b/i, evidence: () => ["html:firebase sdk references"] },
+    { type: "html", re: /firestore\.googleapis\.com/i, evidence: () => ["endpoint:firestore.googleapis.com"] },
+    { type: "html", re: /firebaseio\.com/i, evidence: () => ["endpoint:*.firebaseio.com (Realtime DB)"] },
+  ],
+  note: "Indicates Firebase usage in the web app. Does not prove which Firebase products are enabled server-side.",
+},
+{
+  category: "database_hint",
+  name: "MongoDB Realm / Atlas App Services (hint)",
+  confidence: 0.6,
+  comments: "Only detectable when client integrations leak realm endpoints/SDK usage.",
+  any: [
+    { type: "html", re: /realm\.mongodb\.com/i, evidence: () => ["endpoint:realm.mongodb.com"] },
+    { type: "html", re: /mongodb-stitch/i, evidence: () => ["html:mongodb-stitch (legacy naming)"] },
+  ],
+  note: "Hint only. Most MongoDB usage is backend-only and not visible.",
+},
+{
+  category: "database_hint",
+  name: "MySQL (hint)",
+  confidence: 0.25,
+  comments: "Only detectable via error leaks. Do not treat as reliable.",
+  any: [
+    { type: "html", re: /\bSQLSTATE\[[0-9A-Z]+\]\b/i, evidence: (m) => [`html:sqlstate=${m[0]}`] },
+    { type: "html", re: /\bMySQL server version\b/i, evidence: () => ["html:mysql error text"] },
+    { type: "html", re: /\bmysqli?_connect\b/i, evidence: () => ["html:mysqli_connect (error leak)"] },
+  ],
+  note: "Hint only. Error messages can be spoofed; many stacks suppress them.",
+},
+{
+  category: "database_hint",
+  name: "PostgreSQL (hint)",
+  confidence: 0.25,
+  comments: "Only detectable via error leaks. Do not treat as reliable.",
+  any: [
+    { type: "html", re: /\bPG::/i, evidence: () => ["html:PG::* (Ruby PG errors)"] },
+    { type: "html", re: /\bPostgreSQL\b/i, evidence: () => ["html:postgresql error text"] },
+  ],
+  note: "Hint only. Most production sites will not leak DB errors.",
+},
+  
+  
+  // ---- Operating System hints (very low reliability) ----
+{
+  category: "operating_system_hint",
+  name: "Windows Server (hint)",
+  confidence: 0.45,
+  comments: "Detected primarily via Microsoft IIS or ASP.NET stack exposure. OS cannot be proven via HTTP alone.",
+  any: [
+    {
+      type: "header",
+      header: "server",
+      re: /\bMicrosoft-IIS\/([\d.]+)/i,
+      evidence: (m) => [`header:server=${m[0]}`],
+    },
+    {
+      type: "header",
+      header: "x-powered-by",
+      re: /\bASP\.NET\b/i,
+      evidence: () => ["header:x-powered-by~ASP.NET"],
+    },
+  ],
+  note: "Hint only. IIS can theoretically run in containers or reverse proxy chains.",
+},
+{
+  category: "operating_system_hint",
+  name: "Linux (hint)",
+  confidence: 0.35,
+  comments: "Inferred from typical Linux-native server stacks (nginx, Apache, etc.). Not definitive.",
+  any: [
+    {
+      type: "header",
+      header: "server",
+      re: /\bnginx\b/i,
+      evidence: () => ["header:server~nginx (commonly Linux)"],
+    },
+    {
+      type: "header",
+      header: "server",
+      re: /\bApache\b/i,
+      evidence: () => ["header:server~Apache (commonly Linux)"],
+    },
+  ],
+  note: "Very weak inference. These servers also run on Windows.",
+},
+{
+  category: "operating_system_hint",
+  name: "Debian (hint)",
+  confidence: 0.4,
+  comments: "Some Apache/Nginx builds expose Debian package suffix.",
+  any: [
+    {
+      type: "header",
+      header: "server",
+      re: /\bDebian\b/i,
+      evidence: (m) => [`header:server~${m[0]}`],
+    },
+  ],
+  note: "Only detectable when explicitly leaked in server header.",
+},
+{
+  category: "operating_system_hint",
+  name: "Ubuntu (hint)",
+  confidence: 0.4,
+  comments: "Sometimes exposed in Apache build string.",
+  any: [
+    {
+      type: "header",
+      header: "server",
+      re: /\bUbuntu\b/i,
+      evidence: (m) => [`header:server~${m[0]}`],
+    },
+  ],
+  note: "Only detectable when server header is not hardened.",
+},
+{
+  category: "operating_system_hint",
+  name: "FreeBSD (hint)",
+  confidence: 0.35,
+  comments: "Rarely exposed; sometimes visible in custom builds.",
+  any: [
+    {
+      type: "header",
+      header: "server",
+      re: /\bFreeBSD\b/i,
+      evidence: (m) => [`header:server~${m[0]}`],
+    },
+  ],
+  note: "Very uncommon in public production headers.",
+},
+  
+  
+  // ---- Container / Orchestration hints (very low reliability) ----
+{
+  category: "infra_hint",
+  name: "Kubernetes (hint)",
+  confidence: 0.4,
+  comments: "Indirect detection via ingress controllers or service mesh headers.",
+  any: [
+    {
+      type: "header",
+      header: "x-envoy-upstream-service-time",
+      re: /.+/i,
+      evidence: () => ["header:x-envoy-upstream-service-time (Envoy/Istio mesh)"],
+    },
+    {
+      type: "header",
+      header: "x-envoy-decorator-operation",
+      re: /.+/i,
+      evidence: () => ["header:x-envoy-* (service mesh indicator)"],
+    },
+    {
+      type: "header",
+      header: "server",
+      re: /\bnginx\b/i,
+      evidence: () => ["server:nginx (possible ingress-nginx)"],
+    },
+  ],
+  note: "Hint only. Nginx and Envoy are also used outside Kubernetes.",
+},
+{
+  category: "infra_hint",
+  name: "Docker (hint)",
+  confidence: 0.25,
+  comments: "Docker itself does not expose HTTP fingerprints. Only rare misconfig leaks can reveal it.",
+  any: [
+    {
+      type: "header",
+      header: "server",
+      re: /\bDocker\b/i,
+      evidence: () => ["header:server~Docker (rare/misconfig)"],
+    },
+  ],
+  note: "Docker is not detectable in hardened production environments.",
+},
+{
+  category: "infra_hint",
+  name: "AWS EKS / ALB (hint)",
+  confidence: 0.5,
+  comments: "Cloud provider LB headers may imply container orchestration behind it.",
+  any: [
+    {
+      type: "header",
+      header: "x-amzn-trace-id",
+      re: /.+/i,
+      evidence: () => ["header:x-amzn-trace-id (AWS ALB)"],
+    },
+  ],
+  note: "Indicates AWS infra, not necessarily Kubernetes.",
+},
+{
+  category: "infra_hint",
+  name: "GCP GKE / Google LB (hint)",
+  confidence: 0.5,
+  comments: "Google load balancer may indicate GKE usage.",
+  any: [
+    {
+      type: "header",
+      header: "via",
+      re: /\bgoogle\b/i,
+      evidence: () => ["header:via~google"],
+    },
+  ],
+  note: "Indicates Google Cloud load balancing, not guaranteed Kubernetes.",
+},
+  
+  
+  // ---- Cloud Providers (Infrastructure hints) ----
+{
+  category: "cloud_provider_hint",
+  name: "Amazon Web Services (AWS)",
+  confidence: 0.7,
+  comments: "Detectable via AWS ALB/CloudFront headers or trace IDs.",
+  any: [
+    { type: "header", header: "x-amzn-trace-id", re: /.+/i, evidence: () => ["header:x-amzn-trace-id"] },
+    { type: "header", header: "via", re: /cloudfront/i, evidence: () => ["header:via~cloudfront"] },
+    { type: "header", header: "server", re: /AmazonS3/i, evidence: () => ["server:AmazonS3"] },
+  ],
+  note: "Indicates AWS infra layer, not necessarily EC2 vs EKS vs Lambda.",
+},
+{
+  category: "cloud_provider_hint",
+  name: "Microsoft Azure",
+  confidence: 0.7,
+  comments: "Azure App Service and Front Door expose characteristic headers.",
+  any: [
+    { type: "header", header: "server", re: /Microsoft-IIS/i, evidence: () => ["server:Microsoft-IIS"] },
+    { type: "header", header: "x-azure-ref", re: /.+/i, evidence: () => ["header:x-azure-ref"] },
+    { type: "header", header: "x-ms-request-id", re: /.+/i, evidence: () => ["header:x-ms-request-id"] },
+  ],
+  note: "May indicate Azure App Service or Azure Front Door.",
+},
+{
+  category: "cloud_provider_hint",
+  name: "Google Cloud Platform (GCP)",
+  confidence: 0.7,
+  comments: "Google load balancer and App Engine expose distinct headers.",
+  any: [
+    { type: "header", header: "server", re: /gws/i, evidence: () => ["server:gws"] },
+    { type: "header", header: "via", re: /google/i, evidence: () => ["header:via~google"] },
+    { type: "header", header: "x-cloud-trace-context", re: /.+/i, evidence: () => ["header:x-cloud-trace-context"] },
+  ],
+  note: "Indicates Google Cloud infra (GCE/GKE/App Engine).",
+},
+{
+  category: "cloud_provider_hint",
+  name: "Alibaba Cloud (Aliyun)",
+  confidence: 0.75,
+  comments: "Alibaba CDN and OSS expose characteristic domains and headers.",
+  any: [
+    { type: "header", header: "server", re: /aliyun/i, evidence: () => ["server:aliyun"] },
+    { type: "html", re: /alicdn\.com/i, evidence: () => ["asset:alicdn.com"] },
+  ],
+  note: "Strong presence in China and APAC markets.",
+},
+{
+  category: "cloud_provider_hint",
+  name: "Tencent Cloud",
+  confidence: 0.7,
+  comments: "Tencent CDN and infrastructure headers sometimes visible.",
+  any: [
+    { type: "header", header: "server", re: /tencent/i, evidence: () => ["server:tencent"] },
+    { type: "html", re: /qcloudcdn\.com/i, evidence: () => ["asset:qcloudcdn.com"] },
+  ],
+  note: "Major Chinese cloud provider.",
+},
+{
+  category: "cloud_provider_hint",
+  name: "Huawei Cloud",
+  confidence: 0.7,
+  comments: "Huawei CDN and OBS domains detectable.",
+  any: [
+    { type: "header", header: "server", re: /huawei/i, evidence: () => ["server:huawei"] },
+    { type: "html", re: /huaweicloud\.com/i, evidence: () => ["asset:huaweicloud.com"] },
+  ],
+  note: "Strong presence in Asia, Africa, and enterprise markets.",
+},
+{
+  category: "cloud_provider_hint",
+  name: "Oracle Cloud Infrastructure (OCI)",
+  confidence: 0.6,
+  comments: "OCI sometimes exposes Oracle-specific headers.",
+  any: [
+    { type: "header", header: "server", re: /oracle/i, evidence: () => ["server:oracle"] },
+    { type: "header", header: "x-oracle-dms-ecid", re: /.+/i, evidence: () => ["header:x-oracle-dms-ecid"] },
+  ],
+  note: "Enterprise-heavy footprint.",
+},
+{
+  category: "cloud_provider_hint",
+  name: "IBM Cloud",
+  confidence: 0.6,
+  comments: "IBM Cloud / Bluemix identifiers.",
+  any: [
+    { type: "header", header: "server", re: /ibm/i, evidence: () => ["server:ibm"] },
+    { type: "html", re: /bluemix/i, evidence: () => ["html:bluemix"] },
+  ],
+  note: "Often enterprise workloads.",
+},
+{
+  category: "cloud_provider_hint",
+  name: "DigitalOcean",
+  confidence: 0.65,
+  comments: "Droplet infra rarely exposes headers; CDN/Spaces may leak domain.",
+  any: [
+    { type: "html", re: /digitaloceanspaces\.com/i, evidence: () => ["asset:digitaloceanspaces.com"] },
+  ],
+  note: "Low passive detectability unless using Spaces CDN.",
+},
+{
+  category: "cloud_provider_hint",
+  name: "OVHcloud",
+  confidence: 0.65,
+  comments: "OVH sometimes visible via hosting headers or asset domains.",
+  any: [
+    { type: "header", header: "server", re: /ovh/i, evidence: () => ["server:ovh"] },
+    { type: "html", re: /ovhcloud\.com/i, evidence: () => ["asset:ovhcloud.com"] },
+  ],
+  note: "Major European cloud provider.",
+},
+
+  
   // ---- Analytics ----
   {
     category: "analytics",
@@ -326,7 +764,112 @@ const DETECTION_RULES = [
     comments: "cdn.shopify.com is a strong indicator for storefront assets.",
     any: [{ type: "html", re: /cdn\.shopify\.com/i, evidence: () => ["asset:cdn.shopify.com"] }],
   },
+  {
+  category: "ecommerce_platform",
+  name: "Magento",
+  confidence: 0.85,
+  comments: "Magento exposes distinctive static asset paths and requirejs patterns.",
+  any: [
+    { type: "html", re: /\/static\/version\d+\//i, evidence: () => ["path:/static/version*/ (Magento static assets)"] },
+    { type: "html", re: /mage\/cookies\.js/i, evidence: () => ["script:mage/cookies.js"] },
+    { type: "html", re: /Magento_Ui\//i, evidence: () => ["path:Magento_Ui/"] },
+  ],
+},
+{
+  category: "ecommerce_platform",
+  name: "PrestaShop",
+  confidence: 0.9,
+  comments: "PrestaShop has very recognizable /modules/ and /themes/ structure.",
+  any: [
+    { type: "html", re: /\/modules\/[a-z0-9_\-]+\//i, evidence: () => ["path:/modules/*"] },
+    { type: "html", re: /\/themes\/[a-z0-9_\-]+\//i, evidence: () => ["path:/themes/*"] },
+    { type: "metaGenerator", re: /prestashop/i, evidence: (m) => [`meta:generator=${m[0]}`] },
+  ],
+},
+{
+  category: "ecommerce_platform",
+  name: "Shopify",
+  confidence: 0.92,
+  comments: "cdn.shopify.com and Shopify-specific JS globals are strong indicators.",
+  any: [
+    { type: "html", re: /cdn\.shopify\.com/i, evidence: () => ["asset:cdn.shopify.com"] },
+    { type: "html", re: /Shopify\.theme/i, evidence: () => ["js:Shopify.theme"] },
+  ],
+},
+{
+  category: "ecommerce_platform",
+  name: "WooCommerce",
+  confidence: 0.88,
+  comments: "WooCommerce runs on WordPress; look for wc-* assets and endpoints.",
+  any: [
+    { type: "html", re: /woocommerce/i, evidence: () => ["html:woocommerce keyword"] },
+    { type: "html", re: /\/wp-content\/plugins\/woocommerce\//i, evidence: () => ["path:/wp-content/plugins/woocommerce/"] },
+    { type: "html", re: /wc-ajax=/i, evidence: () => ["query:wc-ajax="] },
+  ],
+},
+{
+  category: "ecommerce_platform",
+  name: "BigCommerce",
+  confidence: 0.85,
+  comments: "BigCommerce exposes bc-* scripts and CDN references.",
+  any: [
+    { type: "html", re: /cdn\d+\.bigcommerce\.com/i, evidence: () => ["asset:bigcommerce CDN"] },
+    { type: "html", re: /window\.BCData/i, evidence: () => ["js:window.BCData"] },
+  ],
+},
+{
+  category: "ecommerce_platform",
+  name: "OpenCart",
+  confidence: 0.82,
+  comments: "Common OpenCart route patterns and catalog/view structure.",
+  any: [
+    { type: "html", re: /index\.php\?route=common\/home/i, evidence: () => ["route:common/home"] },
+    { type: "html", re: /catalog\/view\/theme\//i, evidence: () => ["path:catalog/view/theme/"] },
+  ],
+},
+{
+  category: "ecommerce_platform",
+  name: "Salesforce Commerce Cloud",
+  confidence: 0.8,
+  comments: "Former Demandware. Look for dw-specific assets and pipelines.",
+  any: [
+    { type: "html", re: /\/on\/demandware\.store\//i, evidence: () => ["path:/on/demandware.store/"] },
+    { type: "html", re: /dwac_/i, evidence: () => ["html:dwac_* marker"] },
+  ],
+},
+{
+  category: "ecommerce_platform",
+  name: "SAP Commerce (Hybris)",
+  confidence: 0.75,
+  comments: "Hybris storefronts may expose accelerator paths.",
+  any: [
+    { type: "html", re: /\/_ui\/responsive\//i, evidence: () => ["path:/_ui/responsive/"] },
+    { type: "html", re: /hybris/i, evidence: () => ["html:hybris keyword"] },
+  ],
+},
+{
+  category: "ecommerce_platform",
+  name: "Wix eCommerce",
+  confidence: 0.85,
+  comments: "Wix storefronts load wixstatic assets and Wix-specific JS runtime.",
+  any: [
+    { type: "html", re: /static\.wixstatic\.com/i, evidence: () => ["asset:static.wixstatic.com"] },
+    { type: "html", re: /wix-code-sdk/i, evidence: () => ["html:wix-code-sdk"] },
+  ],
+},
+{
+  category: "ecommerce_platform",
+  name: "Squarespace Commerce",
+  confidence: 0.82,
+  comments: "Squarespace commerce relies on distinctive static.squarespace.com assets.",
+  any: [
+    { type: "html", re: /static\.squarespace\.com/i, evidence: () => ["asset:static.squarespace.com"] },
+    { type: "metaGenerator", re: /squarespace/i, evidence: (m) => [`meta:generator=${m[0]}`] },
+  ],
+},
 
+
+  
   // ---- Front frameworks ----
   {
     category: "frontend_framework",
@@ -451,16 +994,114 @@ const DETECTION_RULES = [
     note: "Hint only (cookie). Not a proof of Spring Boot or any specific framework.",
   },
   {
-    category: "backend_hint",
-    name: ".NET (hint)",
-    confidence: 0.55,
-    comments: "Cookie/header hint only. Frequently stripped in hardened production.",
-    any: [
-      { type: "cookie", re: /\b\.(AspNetCore|ASPXAUTH)=/i, evidence: () => ["cookie:AspNet*"] },
-      { type: "header", header: "x-aspnet-version", re: /.+/i, evidence: (m) => [`header:x-aspnet-version=${m[0]}`] },
-    ],
-    note: "Hint only (cookie/header). Often removed in hardened setups.",
-  },
+  category: "backend_hint",
+  name: ".NET / C# (hint)",
+  confidence: 0.55,
+  comments: "ASP.NET cookies/headers are good hints when exposed; often stripped in production.",
+  any: [
+    { type: "cookie", re: /\b\.(AspNetCore|ASPXAUTH)=/i, evidence: () => ["cookie:AspNet*"] },
+    { type: "cookie", re: /\bASPSESSIONID/i, evidence: () => ["cookie:ASPSESSIONID*"] }, // older ASP/ASP.NET patterns
+    { type: "header", header: "x-aspnet-version", re: /.+/i, evidence: (m) => [`header:x-aspnet-version=${m[0]}`] },
+    { type: "header", header: "x-aspnetmvc-version", re: /.+/i, evidence: (m) => [`header:x-aspnetmvc-version=${m[0]}`] },
+  ],
+  note: "Hint only (cookie/header). Not a proof of the exact .NET stack or version.",
+},
+{
+  category: "backend_hint",
+  name: "Node.js (hint)",
+  confidence: 0.5,
+  comments: "Express/Koa/Hapi often expose X-Powered-By or connect.sid; frequently removed.",
+  any: [
+    { type: "header", header: "x-powered-by", re: /\bexpress\b/i, evidence: (m) => [`header:x-powered-by=${m[0]}`] },
+    { type: "cookie", re: /\bconnect\.sid=/i, evidence: () => ["cookie:connect.sid"] },
+  ],
+  note: "Hint only. Node apps can hide these signals; other stacks can emulate them.",
+},
+{
+  category: "backend_hint",
+  name: "Python (hint)",
+  confidence: 0.45,
+  comments: "Python frameworks sometimes leak server headers; usually hidden behind reverse proxies.",
+  any: [
+    { type: "header", header: "server", re: /\bgunicorn\b/i, evidence: () => ["header:server~gunicorn"] },
+    { type: "header", header: "server", re: /\buwsgi\b/i, evidence: () => ["header:server~uwsgi"] },
+    { type: "cookie", re: /\bsessionid=/i, evidence: () => ["cookie:sessionid (common in Django)"] },
+  ],
+  note: "Hint only. 'sessionid' is not exclusive to Django; headers are often masked.",
+},
+{
+  category: "backend_hint",
+  name: "Ruby (hint)",
+  confidence: 0.5,
+  comments: "Rails apps often use _app_session cookies; Rack/Puma can appear in headers.",
+  any: [
+    { type: "cookie", re: /_session=/i, evidence: () => ["cookie:*_session"] }, // e.g., _myapp_session
+    { type: "header", header: "server", re: /\bpuma\b/i, evidence: () => ["header:server~puma"] },
+    { type: "header", header: "x-runtime", re: /.+/i, evidence: (m) => [`header:x-runtime=${m[0]}`] }, // sometimes Rails
+  ],
+  note: "Hint only. Cookie names are app-defined; not exclusive to Rails.",
+},
+{
+  category: "backend_hint",
+  name: "Go (hint)",
+  confidence: 0.45,
+  comments: "Some Go servers identify themselves; usually removed in hardened setups.",
+  any: [
+    { type: "header", header: "server", re: /\bcaddy\b/i, evidence: () => ["header:server~caddy (often Go)"] },
+    { type: "header", header: "server", re: /\bfasthttp\b/i, evidence: () => ["header:server~fasthttp"] },
+  ],
+  note: "Hint only. Server headers are not reliable indicators of the app language.",
+},
+{
+  category: "backend_hint",
+  name: "Rust (hint)",
+  confidence: 0.4,
+  comments: "Rarely exposed; may show up as framework/server identifiers.",
+  any: [
+    { type: "header", header: "server", re: /\b(actix|rocket|warp)\b/i, evidence: (m) => [`header:server~${m[0]}`] },
+  ],
+  note: "Hint only. These markers are uncommon on public-facing production systems.",
+},
+{
+  category: "backend_hint",
+  name: "Kotlin (JVM) (hint)",
+  confidence: 0.35,
+  comments: "Kotlin runs on the JVM; without app-level disclosure, it's indistinguishable from Java.",
+  any: [
+    { type: "header", header: "x-powered-by", re: /\bktor\b/i, evidence: () => ["header:x-powered-by~ktor"] },
+  ],
+  note: "Hint only. Most Kotlin backends look identical to Java at the HTTP layer.",
+},
+{
+  category: "backend_hint",
+  name: "Scala (JVM) (hint)",
+  confidence: 0.35,
+  comments: "Scala is also JVM-based; Play can leak headers in some configs.",
+  any: [
+    { type: "header", header: "server", re: /\bplay\b/i, evidence: () => ["header:server~play"] },
+  ],
+  note: "Hint only. JVM stacks are hard to separate reliably via passive fingerprints.",
+},
+{
+  category: "backend_hint",
+  name: "Elixir (hint)",
+  confidence: 0.4,
+  comments: "Phoenix sometimes exposes 'cowboy' server header (Erlang/Elixir ecosystem).",
+  any: [
+    { type: "header", header: "server", re: /\bcowboy\b/i, evidence: () => ["header:server~cowboy"] },
+  ],
+  note: "Hint only. Cowboy can front multiple BEAM languages; not exclusive to Elixir.",
+},
+{
+  category: "backend_hint",
+  name: "JavaScript (Server) (hint)",
+  confidence: 0.35,
+  comments: "Generic JS-server hint if only a non-specific x-powered-by leaks.",
+  any: [
+    { type: "header", header: "x-powered-by", re: /\b(koa|hapi|next\.js|nestjs)\b/i, evidence: (m) => [`header:x-powered-by=${m[0]}`] },
+  ],
+  note: "Hint only. Any x-powered-by is easy to remove/spoof.",
+},
 ];
 
 // -------------------------
@@ -552,7 +1193,7 @@ function applyRule(rule, ctx) {
     comments: rule.comments, // keep maintainer notes in output; remove if you don't want to expose
   };
 }
-
+// detect technos
 function detectTechnos({ url, headers, html }) {
   const h = headersToLowerMap(headers);
   const metaGenerator = extractMetaGenerator(html);
@@ -611,7 +1252,8 @@ async function handleAnalyze(req, res) {
   try {
     const fetchedAt = new Date().toISOString();
     const r = await fetchHtmlWithGuards(u);
-
+    const protocols = await detectProtocols(r.finalUrl, r.headers);
+    
     const tech = detectTechnos({
       url: r.finalUrl,
       headers: r.headers,
@@ -633,6 +1275,8 @@ async function handleAnalyze(req, res) {
       truncated: r.truncated,
       response: { status: r.status, headers: r.headers },
       performance,
+      protocols,
+      delivery,
       tech,
     });
   } catch (e) {
