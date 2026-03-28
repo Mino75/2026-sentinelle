@@ -1253,6 +1253,7 @@ async function handleAnalyze(req, res) {
     const fetchedAt = new Date().toISOString();
     const r = await fetchHtmlWithGuards(u);
     const protocols = await detectProtocols(r.finalUrl, r.headers);
+    const delivery = detectDelivery(r.headers);
     
     const tech = detectTechnos({
       url: r.finalUrl,
